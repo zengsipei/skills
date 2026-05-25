@@ -1,0 +1,75 @@
+name: Sync fork with upstream
+
+# Keeps this fork's default branch in lockstep with the upstream
+# parent repository on a recurring schedule by calling GitHub's
+# merge-upstream API, the same operation as clicking "Sync fork"
+# on the web UI. Conflicts cause the workflow to fail visibly so
+# they can be investigated.
+
+on:
+  schedule:
+    # Daily at 03:17 Asia/Shanghai (19:17 UTC).
+    # Minute 17 avoids the on-the-hour cron stampede on GitHub's
+    # shared runners.
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync default branch from upstream
+        env:
+          # Token selection with graceful degradation:
+          #
+          # 1. SYNC_FORK_TOKEN - a PAT (classic with repo + workflow,
+          #    or fine-grained with Contents:write + Workflows:write)
+          #    or GitHub App token. Required when upstream commits
+          #    touch .github/workflows/**.
+          #
+          # 2. GITHUB_TOKEN (fallback) - the default Actions token.
+          #    Works for upstreams that never modify workflow files.
+          #    If upstream eventually changes a workflow, provision
+          #    SYNC_FORK_TOKEN and re-run. No edit to this file is
+          #    needed; the expression below picks up the new secret.
+          GH_TOKEN: ${{ secrets.SYNC_FORK_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_FORK_TOKEN != '' }}
+          REPO: ${{ github.repository }}
+          BRANCH: main
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_SYNC_TOKEN" = "true" ]; then
+            echo "Token: SYNC_FORK_TOKEN (custom PAT/App with workflow scope)"
+          else
+            echo "Token: default GITHUB_TOKEN (no workflow scope)"
+            echo "::notice::Using default GITHUB_TOKEN. If upstream commits touch .github/workflows/**, this run will fail. Set the SYNC_FORK_TOKEN secret to a PAT with workflow scope to enable workflow-aware syncs."
+          fi
+
+          UPSTREAM=$(gh api "repos/$REPO" --jq '.parent.full_name // empty')
+          if [ -z "$UPSTREAM" ]; then
+            echo "::error::$REPO is not a fork - nothing to sync."
+            exit 1
+          fi
+
+          echo "Upstream detected: $UPSTREAM"
+          echo "Syncing $REPO:$BRANCH from $UPSTREAM..."
+
+          set +e
+          gh repo sync "$REPO" --branch "$BRANCH"
+          rc=$?
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            if [ "$HAS_SYNC_TOKEN" != "true" ]; then
+              echo "::warning::Sync failed. If the error above mentions 'workflow scope', provision SYNC_FORK_TOKEN (PAT with workflow scope) and re-run. The fallback expression in this workflow will pick it up automatically; no file edit needed."
+            fi
+            exit "$rc"
+          fi
